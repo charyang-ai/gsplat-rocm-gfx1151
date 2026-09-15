@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# `pip install -e kernels/*` regenerates these into the working tree
+*.egg-info/
+build/
+dist/
+
+# Triton compiles per shape-specialisation, so this grows across resolutions
+.triton/
+
+# recalibration output -- regenerate on the target box, do not carry R9700's over
+results/
+trace*.json
+*.pdf

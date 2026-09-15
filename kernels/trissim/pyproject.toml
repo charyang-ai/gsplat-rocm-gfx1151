@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fused-ssim-tbwd"
+version = "0.1.0"
+description = "Fully-Triton fused SSIM (autotuned forward AND backward) for ROCm/CUDA gsplat training"
+readme = "README.md"
+requires-python = ">=3.9"
+# torch + triton are intentionally NOT listed here: on ROCm they ship together with
+# the pre-installed PyTorch build, and pinning them would risk pip pulling a CUDA wheel
+# and clobbering the ROCm install. The package degrades gracefully (separable torch
+# fallback) if triton is unavailable.
+dependencies = []
+
+[project.optional-dependencies]
+# only for the standalone perf/correctness check; torch is assumed already present
+dev = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,27 @@
+--- a/gsplat/cuda/include/Common.cuh
++++ b/gsplat/cuda/include/Common.cuh
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <ATen/ops/empty.h>  // CUB_WRAPPER's temp storage
+ #include <glm/gtc/type_ptr.hpp>
+ 
+ #ifndef USE_ROCM
+@@ -61,10 +62,12 @@
+ #define CUB_WRAPPER(func, ...)                                                 \
+     do {                                                                       \
+         size_t temp_storage_bytes = 0;                                         \
+-        auto res = func(nullptr, temp_storage_bytes, __VA_ARGS__);                        \
+-        auto &caching_allocator = *::c10::hip::HIPCachingAllocator::get();   \
+-        auto temp_storage = caching_allocator.allocate(temp_storage_bytes);    \
+-        res = func(temp_storage.get(), temp_storage_bytes, __VA_ARGS__);  \
++        auto res = func(nullptr, temp_storage_bytes, __VA_ARGS__);              \
++        auto temp_storage = at::empty(                                          \
++            {static_cast<int64_t>(temp_storage_bytes)},                         \
++            at::TensorOptions().dtype(at::kByte).device(at::kCUDA)              \
++        );                                                                     \
++        res = func(temp_storage.data_ptr(), temp_storage_bytes, __VA_ARGS__);   \
+ 	assert(res == hipSuccess);                                            \
+     } while (false)
+ #endif

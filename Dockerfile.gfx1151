@@ -1,0 +1,314 @@
+# ============================================================
+# gsplat (ROCm fork) built for AMD gfx1151 / RDNA3.5 (wave32).
+#
+# Target:
+#   AMD Ryzen AI Max "Strix Halo" / Radeon 8060S (RDNA3.5, gfx1151) — a wave32 part, like all
+#   gfx10/11/12 (RDNA). This matters: the ROCm gsplat fork was written for CDNA
+#   (gfx9, wave64) and hardcodes a 64-lane warp in its reduction / leader-election
+#   kernels. On a wave32 arch those paths either hit rocprim's NAVI "invalid warp
+#   size" no-op or silently corrupt the backward color/gradient results, so gfx1151
+#   needs the same wave32 source patch that the gfx1151 (Strix Halo) image uses.
+#
+# ROCm:    7.2.1     (stock rocm/pytorch base)
+# PyTorch: 2.9.1     (ROCm build shipped in the base image)
+#
+# Three build-time fixes are applied here (all needed for a correct gfx1151 .so):
+#   1. Honor PYTORCH_ROCM_ARCH so the kernels are compiled for gfx1151. Upstream
+#      setup.py runs rocminfo, which finds NO GPU at `docker build` time and falls
+#      back to gfx942 (CDNA) -> a .so with no gfx1151 code objects.
+#   2. Vendored-glm include dir first + -DTORCH_HIP_VERSION=8000 (satisfies the
+#      glm CUDA-version gate that hipify rewrites into an undefined-macro compare).
+#   3. glm .inl top-up after hipify (hipify copies glm's .hpp but not the sibling
+#      .inl files) — done as the cp between the two build passes below.
+#   4. guarded WARP_SIZE source patch (wave32 vs wave64), see above.
+# Fixes (1)+(2) live in patches/setup.py.gfx1151.patch; (4) in
+# patches/wave_size.gfx1151.patch; (3) is the cp between the two build passes.
+#
+# Build (no GPU needed):
+#   docker build -f Dockerfile.gfx1151 -t gsplat-rocm:gfx1151-rocm72 .
+# Run the GPU smoke test (needs a healthy gfx1151 GPU exposed to the container):
+#   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+#     --security-opt seccomp=unconfined gsplat-rocm:gfx1151-rocm72
+# ============================================================
+
+
+# rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1 — stock ROCm
+# 7.2.1 + torch 2.9.1. NOTE: pinned to a *mutable* tag, not a digest; AMD can
+# repush the tag with a different ROCm/torch/rocprim build. For a fully
+# reproducible image, resolve and pin the digest (rocm/pytorch@sha256:...) via:
+#   docker buildx imagetools inspect rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+FROM rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+
+
+# Pin the fork + glm submodule ref so the build is reproducible, and select the
+# target arch once. GPU_ARCH flows into both the runtime env (below) and, via
+# PYTORCH_ROCM_ARCH, into setup.py's --offload-arch (fix 1).
+ARG GSPLAT_REF=b01acd43e3c7fa942f95fda0974e9125e4de7395
+ARG GPU_ARCH=gfx1151
+ARG MAX_JOBS=8
+# TriSSIM (Triton-based fused SSIM loss) replaces the CUDA-only upstream fused_ssim.
+# Pinned to a mutable branch by default; pass --build-arg TRISSIM_REF=<commit> for a
+# fully reproducible build.
+ARG TRISSIM_REF=main
+
+# PYTORCH_ROCM_ARCH is the one the patched setup.py reads to pick --offload-arch;
+# GPU_ARCHS mirrors it for tools that expect that name; MAX_JOBS caps the ninja
+# parallelism (the HIP compile is memory-hungry — 8 is a safe default).
+ENV GPU_ARCHS=${GPU_ARCH} \
+    PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    MAX_JOBS=${MAX_JOBS}
+
+
+# ------------------------------------------------------------
+# build dependencies
+# ------------------------------------------------------------
+# git + git submodule for the fork/glm checkout; ninja/cmake/build-essential for
+# the torch extension build. libglm-dev is a convenience fallback only — the build
+# actually uses the *vendored* glm submodule (setup.py patch puts it first on the
+# include path because system glm is API-incompatible), so it is harmless here.
+RUN apt-get update && apt-get install -y \
+    git \
+    ninja-build \
+    cmake \
+    build-essential \
+    libglm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# setup.py's get_git_rev() reads the repo HEAD to stamp the version; allow git to
+# operate on the clone even though it is owned by a different uid inside the image.
+RUN git config --global --add safe.directory '*'
+
+
+# ------------------------------------------------------------
+# clone ROCm gsplat fork
+# ------------------------------------------------------------
+# Clone the ROCm fork at the pinned ref and pull the vendored glm submodule
+# (gsplat/cuda/csrc/third_party/glm) that the kernels include.
+RUN git clone https://github.com/ROCm/gsplat /opt/gsplat \
+    && cd /opt/gsplat \
+    && git checkout ${GSPLAT_REF} \
+    && git submodule update --init --recursive
+
+WORKDIR /opt/gsplat
+
+
+# ------------------------------------------------------------
+# gfx1151 build configuration
+# ------------------------------------------------------------
+# Empty TORCH_CUDA_ARCH_LIST so the torch helpers don't try to append NVIDIA SM
+# arches to the (HIP) build; HIP_ARCHITECTURES echoes the target for any CMake
+# path that reads it. The authoritative arch selection is PYTORCH_ROCM_ARCH above.
+ENV TORCH_CUDA_ARCH_LIST=""
+ENV HIP_ARCHITECTURES=${GPU_ARCH}
+
+# Fixes (1) + (2): honor PYTORCH_ROCM_ARCH for --offload-arch (else it silently
+# falls back to gfx942), put the vendored glm include first, and add
+# -DTORCH_HIP_VERSION=8000 to satisfy glm's hipify-rewritten CUDA-version gate.
+COPY patches/setup.py.gfx1151.patch /tmp/setup.py.gfx1151.patch
+RUN git apply --verbose /tmp/setup.py.gfx1151.patch
+
+# Fix (4): guarded WARP_SIZE on the CUDA sources (applied BEFORE hipify runs). The
+# patch threads a compile-time `constexpr int WARP_SIZE` (64 on CDNA/gfx9, 32 on
+# RDNA incl. gfx1151) through the reduction/tiling kernels and routes wave32 away
+# from the wave64-only DPP reduction, leaving the CDNA wave64 path byte-identical.
+COPY patches/wave_size.gfx1151.patch /tmp/wave_size.gfx1151.patch
+RUN git apply --verbose /tmp/wave_size.gfx1151.patch
+
+# Fix (5): torch >= 2.10 removed `c10::hip::HIPCachingAllocator::get()`, which
+# CUB_WRAPPER reached for. Route the temp storage through `at::empty` instead --
+# same caching allocator, a spelling that exists on every version. This patch is
+# deliberately WARP_SIZE-free: the wave32 fix above already owns that hunk of
+# Common.cuh, and a patch carrying both would conflict with it.
+COPY patches/cub_allocator_torch210.patch /tmp/cub_allocator_torch210.patch
+RUN git apply --verbose /tmp/cub_allocator_torch210.patch
+
+# Fix (6): expose the fork's internal rocprim DeviceRadixSort::SortPairs to Python
+# as `intersect_sort_pairs`, so triisect can sort an explicit bit range (14-bit tile
+# keys instead of 46-bit full keys). Architecture-neutral. Without it triisect still
+# runs, falling back to torch.sort(stable=True) at roughly twice the memory traffic.
+COPY patches/expose_sort.patch /tmp/expose_sort.patch
+RUN git apply --verbose /tmp/expose_sort.patch
+
+
+# ------------------------------------------------------------
+# build gsplat HIP extension
+# ------------------------------------------------------------
+# Two-pass build (fix 3):
+#   PASS 1 triggers hipify (cuda/csrc -> hip/csrc) and fails on a missing glm
+#          .inl — hipify copies glm's .hpp headers but not the sibling .inl. This
+#          failure is EXPECTED (the `|| echo` keeps the layer from erroring out).
+#   FIX    top up the hipified glm tree with a complete copy (adds the .inl files).
+#   PASS 2 compiles cleanly -> gsplat/csrc.so and installs the editable package.
+RUN pip install --no-build-isolation -e . 2>&1 | tail -8 \
+    || echo "pass1 expected-fail (glm .inl missing after hipify)"; \
+  cp -rf gsplat/cuda/csrc/third_party/glm/. gsplat/hip/csrc/third_party/glm/; \
+  pip install --no-build-isolation -e . 2>&1 | tail -8
+
+# GPU smoke test (rasterize) — the default CMD runs it; kept here so the file is
+# baked into the image at build time.
+COPY tests/smoke_test.py /opt/gsplat/smoke_test.py
+
+# P1 numerical-correctness test (run on the GPU post-build): compares the HIP
+# fwd+bwd against the fork's torch reference and is the wave32 merge gate. Run with:
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/correctness_test.py
+COPY tests/correctness_test.py /opt/gsplat/correctness_test.py
+
+# In-pipeline TriSSIM fused-SSIM perf/correctness benchmark (run on the GPU post-build;
+# imports the fused_ssim_biauto package installed further below — i.e. the exact loss the
+# image trains with). Run with:
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/ssim_bench_pipeline.py
+COPY tests/ssim_bench_pipeline.py /opt/gsplat/ssim_bench_pipeline.py
+
+# Offline, self-contained SSIM benchmark: five inline variants (baseline / separable /
+# torch.compile / triton / bi-autotune Triton), no TriSSIM import needed. Handy for
+# comparing SSIM kernels on the GPU independent of the training pipeline. Run with:
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/ssim_bench_offline.py
+COPY tests/ssim_bench_offline.py /opt/gsplat/ssim_bench_offline.py
+
+# torch.profiler harness: runs a few dozen synthetic 3DGS training steps (rasterize
+# fwd+bwd + loss + optimizer, no dataset needed) and prints kernels sorted by GPU time,
+# to locate the real bottleneck. `--ssim` selects the loss and defaults to `trissim`
+# (installed below); `--ssim baseline|separable` swap in the pure-torch convolution
+# variants, which makes a before/after profile a one-flag change. `--ras_bwd triton`
+# does the same for the rasterizer backward (see triraster below). Run with:
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/profile_trainer.py
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/profile_trainer.py --ssim baseline
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/profile_trainer.py --ras_bwd triton
+COPY tests/profile_trainer.py /opt/gsplat/profile_trainer.py
+
+# Build-time verification (no GPU op): the .so linked and the package imports.
+RUN test -f /opt/gsplat/gsplat/csrc.so && python /opt/gsplat/smoke_test.py import
+
+
+# ------------------------------------------------------------
+# trainer dependencies
+# ------------------------------------------------------------
+# examples/simple_trainer.py (the standard gsplat 3DGS trainer/benchmark) needs
+# extra deps: pycolmap, tyro, torchmetrics[image], imageio, nerfview, viser, ...
+# torchvision is ALREADY present in the rocm base, so torch is not reinstalled.
+RUN pip install --no-cache-dir -r examples/requirements.txt
+
+
+# ------------------------------------------------------------
+# ROCm replacement of CUDA fused_ssim  (TriSSIM)
+# ------------------------------------------------------------
+# Upstream fused_ssim ships as a CUDA extension that does NOT build on ROCm. Replace
+# it with TriSSIM: a fully-Triton, autotuned forward+backward fused SSIM loss that runs
+# on ROCm (and CUDA), with a pure-torch separable fallback when Triton is unavailable.
+# Installs the `fused_ssim_biauto` package. torch/triton are intentionally not deps, so
+# --no-build-isolation reuses the base image's ROCm torch/triton (no CUDA-wheel pull).
+RUN git clone https://github.com/charyang-ai/TriSSIM.git /opt/trissim \
+    && cd /opt/trissim \
+    && git checkout ${TRISSIM_REF} \
+    && pip install --no-build-isolation --no-cache-dir .
+
+# gsplat's trainer imports the top-level name `from fused_ssim import fused_ssim`, but
+# TriSSIM exposes `fused_ssim_biauto`. Drop a tiny top-level compatibility module that
+# re-exports TriSSIM's API so the trainer resolves it with no PYTHONPATH wiring.
+RUN python - <<'EOF'
+import os, sysconfig
+site = sysconfig.get_paths()["purelib"]
+path = os.path.join(site, "fused_ssim.py")
+with open(path, "w") as f:
+    f.write(
+        "# top-level shim: gsplat imports `from fused_ssim import fused_ssim`;\n"
+        "# TriSSIM installs the API under `fused_ssim_biauto`.\n"
+        "from fused_ssim_biauto import fused_ssim, _HAS_TRITON, _gaussian_1d\n"
+    )
+print("wrote", path)
+EOF
+
+# Build-time gate (no GPU op): TriSSIM is the image's default SSIM, so assert that the
+# top-level name resolves AND that the Triton fast path is live. Without this the loss
+# would silently degrade to the pure-torch separable fallback and every profile taken
+# in this image would be measuring the wrong kernels.
+RUN python -c "import fused_ssim; \
+assert fused_ssim._HAS_TRITON, 'TriSSIM installed but the Triton fast path is unavailable'; \
+print('TRISSIM OK (default SSIM, triton fast path enabled)')"
+
+
+# ------------------------------------------------------------
+# Triton rasterizer backward  (triraster)
+# ------------------------------------------------------------
+# With the SSIM loss fused, `rasterize_to_pixels_3dgs_bwd_kernel` becomes the largest
+# single kernel in a training step (~24% of GPU time at 500k Gaussians / 1080p).
+# triraster is an autotuned Triton reimplementation of that ONE kernel; the HIP forward
+# rasterizer and every other gsplat kernel are untouched. It is installed but NOT
+# enabled by default: it is opt-in per run via `profile_trainer.py --ras_bwd triton`,
+# so the stock HIP numbers can never move without being asked for.
+COPY triraster /opt/triraster
+RUN pip install --no-build-isolation --no-cache-dir /opt/triraster
+
+# Gradient-correctness gate for triraster (run on the GPU post-build): drives the
+# rasterizer directly and compares all five gradients against the HIP kernel. This is
+# the merge gate for the Triton backward. `--verify-configs` widens it to every autotune
+# candidate (autotuning is per shape-specialisation, so a training run at another
+# resolution can land on a config the default run never exercised) and `--grad-bias`
+# checks the per-Gaussian gradient norm, which is what densification thresholds. Run:
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/rasbwd_correctness_test.py
+#   docker run ... gsplat-rocm:gfx1151-rocm72 python /opt/gsplat/rasbwd_correctness_test.py --verify-configs
+COPY tests/rasbwd_correctness_test.py /opt/gsplat/rasbwd_correctness_test.py
+
+# `examples/simple_trainer.py` has no --tile_size flag and never passes one, so it
+# silently takes whatever `rasterization()` defaults to. This wrapper injects the tile
+# size (and optionally triraster) from the environment, without editing gsplat -- which
+# matters when two runs share one /opt/gsplat on different GPUs. Run with:
+#   GSPLAT_TILE_SIZE=16 python /opt/gsplat/run_simple_trainer.py default --data_dir ...
+COPY tests/run_simple_trainer.py /opt/gsplat/run_simple_trainer.py
+
+# Build-time gate (no GPU op): the package imports and its Triton path is live. Without
+# this, `--ras_bwd triton` would fall back to the HIP kernel and a profile would show a
+# Triton backward that mysteriously performs exactly like the one it replaced.
+RUN python -c "import triraster; \
+assert triraster._HAS_TRITON, 'triraster installed but the Triton path is unavailable'; \
+print('TRIRASTER OK (opt-in via --ras_bwd triton)')"
+
+
+# ------------------------------------------------------------
+# sanity test
+# ------------------------------------------------------------
+# Build-time sanity (no GPU op): every trainer import resolves.
+RUN python -c "import torch, torchvision, torchmetrics, pycolmap, tyro, imageio, cv2, \
+nerfview, viser, fused_ssim; print('TRAINER DEPS OK', torch.__version__, torch.version.hip)"
+
+
+# Build-time sanity (no GPU op): gsplat itself imports and reports the toolchain.
+RUN python - <<EOF
+import torch
+import gsplat
+
+print("Torch:", torch.__version__)
+print("HIP:", torch.version.hip)
+print("GPU available:", torch.cuda.is_available())
+print("gsplat:", gsplat.__file__)
+EOF
+
+
+# ------------------------------------------------------------
+# runtime performance knobs (ROCm / RDNA3.5) — Tier 1, near-zero-cost
+# ------------------------------------------------------------
+# All are RUNTIME env (override at `docker run` with -e ...). Mount the cache dir as a
+# volume to PERSIST tuning results across containers; otherwise TunableOp/MIOpen re-tune
+# on every fresh run (correct, just slower for the first iterations).
+#   * PYTORCH_TUNABLEOP_ENABLED/TUNING — autotune rocBLAS GEMMs per shape, cache the
+#     winner to FILENAME. Big win for the many matmuls in projection/SH/optimizer.
+#   * MIOPEN_FIND_MODE=3 (FAST) + a writable user DB — tune & cache convolutions
+#     (e.g. any conv in perceptual losses / the SSIM fallback path).
+#   * PYTORCH_HIP_ALLOC_CONF=expandable_segments:True — cut allocator fragmentation and
+#     OOM risk on long 3DGS trainings (Gaussian count grows via densification).
+# Set PYTORCH_TUNABLEOP_TUNING=0 (keep ENABLED=1) once the CSV cache is warm to skip
+# re-tuning and just use the cached kernels.
+RUN mkdir -p /opt/gsplat/.tune/tunableop /opt/gsplat/.tune/miopen
+ENV PYTORCH_TUNABLEOP_ENABLED=1 \
+    PYTORCH_TUNABLEOP_TUNING=1 \
+    PYTORCH_TUNABLEOP_FILENAME=/opt/gsplat/.tune/tunableop/tuned_%d.csv \
+    MIOPEN_FIND_MODE=3 \
+    MIOPEN_USER_DB_PATH=/opt/gsplat/.tune/miopen \
+    MIOPEN_CUSTOM_CACHE_DIR=/opt/gsplat/.tune/miopen \
+    PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+
+
+# Default entrypoint: run the GPU rasterize smoke test (needs a gfx1151 GPU
+# exposed to the container — see the run command in the header).
+CMD ["python", "/opt/gsplat/smoke_test.py", "rasterize"]

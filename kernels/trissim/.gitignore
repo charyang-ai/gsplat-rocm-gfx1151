@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+# `pip install -e .` regenerates these from pyproject.toml and README.md
+*.egg-info/
+build/
+dist/
+
+# Triton compiles per shape-specialisation, so this grows across resolutions
+.triton/
