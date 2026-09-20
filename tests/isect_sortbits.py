@@ -1,4 +1,4 @@
-"""Where the narrowed sort's remaining cost is, and whether the key is narrow enough.
+r"""Where the narrowed sort's remaining cost is, and whether the key is narrow enough.
 
 \S3.4's argument is that the sort's cost is linear in the number of significant key bits.
 That is true only in steps: a radix sort with an \(r\)-bit digit costs
@@ -39,8 +39,13 @@ _add_local_paths()
 
 from triisect._core import _bit_width, _sort_pairs  # noqa: E402
 
-# AMD Radeon AI PRO R9700, as quoted in the paper.
-_PEAK_GBPS = 640.0
+# Theoretical peak bandwidth of the part under test, used only to turn measured GB/s into
+# a "% of peak" column -- so a stale value does not change any timing, it just silently
+# rescales every efficiency figure this script prints.
+#   R9700 (RDNA 4, gfx1201):   640.0  GDDR6
+#   Strix Halo (gfx1151):      256.0  LPDDR5X-8000 over 256 bit, per pp_dpm_mclk 1000 MHz
+# Override with --peak-gbps when running on anything else.
+_PEAK_GBPS = 256.0
 
 
 def run_staircase(args) -> dict:
@@ -98,7 +103,7 @@ def run_staircase(args) -> dict:
         step = "" if prev is None else f"  {ms/prev:.2f}x vs prev"
         out[end_bit] = dict(ms=ms, passes=passes, gbps=bw)
         print(f"{end_bit:>8}{passes:>12}{ms:>9.3f}{ms/end_bit:>9.4f}"
-              f"{bw:>9.1f}{100*bw/_PEAK_GBPS:>8.1f}%{step}")
+              f"{bw:>9.1f}{100*bw/args.peak_gbps:>8.1f}%{step}")
         prev = ms
     return out
 
@@ -140,6 +145,9 @@ def main() -> None:
     p.add_argument("--end-bits", type=int, nargs="*",
                    default=[8, 13, 15, 16, 17, 20, 24, 25, 32])
     p.add_argument("--boundary", action="store_true")
+    p.add_argument("--peak-gbps", type=float, default=_PEAK_GBPS,
+                   help="theoretical peak bandwidth for the 'of peak' column (GB/s); "
+                        "defaults to the gfx1151 figure, see _PEAK_GBPS")
     p.add_argument("--json", default=None)
     args = p.parse_args()
     args.res = [(1920, 1080), (2560, 1440), (3840, 2160), (618, 411)]

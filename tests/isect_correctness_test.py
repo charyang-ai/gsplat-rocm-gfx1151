@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import inspect
 import math
 import os
 import sys
@@ -559,7 +560,13 @@ def run_dispatch(args) -> bool:
     """
     device = torch.device("cuda")
     w, h = 618, 411
-    density, min_pairs = 1.5, 3_000_000
+    # Read the thresholds off the shipped signature rather than restating them. These are
+    # per-part fitted constants (`tests/isect_fit_dispatch.py` moved min_pairs from
+    # 3_000_000 to 2_000_000 for gfx1151), and a hardcoded copy here would keep passing
+    # while testing a rule the package no longer uses.
+    _params = inspect.signature(triisect.isect_tiles).parameters
+    density = _params["min_density"].default
+    min_pairs = _params["min_pairs"].default
     print(f"level 6: dispatch at min_density={density}, min_pairs={min_pairs}, "
           f"{w}x{h}\n")
     hdr = (f"{'N':>9}{'scale':>7}{'tile':>5}{'pairs/G':>10}{'n_pairs':>11}"

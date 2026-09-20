@@ -45,7 +45,20 @@ from gsplat.cuda._wrapper import (  # noqa: E402
     isect_tiles as hip_isect_tiles,
 )
 
-_EXAMPLES = os.path.join(os.path.dirname(_HERE), ".gsplat", "examples")
+# Two layouts, as in train_realscene.py: a `.gsplat/` checkout beside `tests/` in the
+# development tree, or `tests/` copied into the gsplat checkout in the gfx1151 container.
+_EXAMPLES_CANDIDATES = (
+    os.path.join(os.path.dirname(_HERE), ".gsplat", "examples"),
+    os.path.join(os.path.dirname(_HERE), "examples"),
+)
+
+
+def _find_examples() -> str:
+    for cand in _EXAMPLES_CANDIDATES:
+        if os.path.isfile(os.path.join(cand, "datasets", "colmap.py")):
+            return cand
+    sys.exit("no gsplat examples (datasets/colmap.py) at any of:\n  "
+             + "\n  ".join(_EXAMPLES_CANDIDATES))
 
 
 # ----------------------------------------------------------------------------------
@@ -59,8 +72,9 @@ def _load_checkpoint(path: str, device) -> dict:
     colour. Cameras come from the COLMAP parser rather than the Dataset so that
     nothing decodes 200 JPEGs to learn an image size.
     """
-    if _EXAMPLES not in sys.path:
-        sys.path.insert(0, _EXAMPLES)
+    examples = _find_examples()
+    if examples not in sys.path:
+        sys.path.insert(0, examples)
     from datasets.colmap import Parser
 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)

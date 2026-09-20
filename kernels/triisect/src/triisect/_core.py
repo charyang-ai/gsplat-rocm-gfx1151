@@ -625,7 +625,7 @@ def isect_tiles(
     conics: Optional[torch.Tensor] = None,
     eps: float = 5e-4,
     min_density: Optional[float] = 1.5,
-    min_pairs: int = 3_000_000,
+    min_pairs: int = 2_000_000,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Drop-in for `gsplat.cuda._wrapper.isect_tiles`.
 
@@ -650,10 +650,21 @@ def isect_tiles(
 
     `min_density` and `min_pairs` are the two conditions under which this path is taken
     rather than the HIP op's; see `_worth_it` for why one number is not enough. The
-    defaults are chosen on 80 timed operating points from five trained Mip-NeRF 360 scenes
-    (`tests/isect_realscene.py`, scored by `tests/isect_fit_dispatch.py`), where they reach
-    99.5% of what an oracle that always picked the faster path would get, and they are
-    perfect on the synthetic sweep that was held out of that choice. The count kernel that
+    defaults are chosen on timed operating points from five trained Mip-NeRF 360 scenes
+    (`tests/isect_realscene.py`, scored by `tests/isect_fit_dispatch.py`), scoring against
+    an oracle that always picks the faster path. On gfx1201 that was 80 points reaching
+    99.5%; `min_pairs` was refitted on gfx1151 over 90 points and lowered from 3_000_000,
+    which takes 98.0% there, to 2_000_000, which takes 99.9%.
+
+    `min_density` did *not* move. Lower bandwidth was expected to let this path win at
+    lower densities too, but the gfx1151 sweep peaks at exactly 1.5 in every `min_pairs`
+    column, so only the absolute-size term needed refitting. The least-squares cost model
+    fitted on the same 90 points agrees without being told to: its break-even density is
+    `a/b = 1.2583/0.8387 = 1.50`, arrived at from the timings alone. So the density term
+    is the ratio of two costs that evidently scale together across these two parts, while
+    the fixed per-call cost that `min_pairs` stands in for does not.
+
+    The count kernel that
     supplies the test is 0.02 ms and its synchronization is one the pipeline performs
     anyway, so the check is close to free, and falling back is transparent: the HIP op
     returns 64-bit keys, and `isect_offset_encode` dispatches on key dtype and encodes

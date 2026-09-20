@@ -8,16 +8,49 @@ Unless stated otherwise the workload is 500k Gaussians, 1920×1080, SH degree 3.
 
 ## Hardware
 
-Fill in the right-hand column from `rocminfo` on the Strix Halo box before
-using any of the derived numbers below.
+The right-hand column is measured on the target box (`halo4`: Ryzen AI MAX+ 395 /
+Radeon 8060S, Ubuntu 24.04, Linux 7.0.0, ROCm 7.2.1). Read from the KFD topology
+at `/sys/class/kfd/kfd/topology/nodes/1/properties`, which reports the same
+values `rocminfo` does and does not need `/dev/kfd` write access.
 
-| | R9700 (measured) | Strix Halo (fill in) |
+| | R9700 (measured) | Strix Halo (measured) |
 |---|---|---|
-| Architecture | RDNA 4 / gfx1201 | RDNA 3.5 / gfx1151 |
-| Wavefront | 32 | 32 |
-| Compute units | 64 | ? (spec sheets say 40) |
-| Memory | GDDR6, 640 GB/s | LPDDR5X unified, ? (spec sheets say ~256 GB/s) |
-| LDS per workgroup | 64 KB | ? |
+| Architecture | RDNA 4 / gfx1201 | RDNA 3.5 / gfx1151 (`gfx_target_version 110501`) |
+| Wavefront | 32 | 32 (`wave_front_size 32`) |
+| Compute units | 64 | 40 (`simd_count 80` / `simd_per_cu 2`) |
+| Memory | GDDR6, 640 GB/s | LPDDR5X-8000 unified, 256-bit → 256 GB/s |
+| LDS per workgroup | 64 KB | 64 KB (`lds_size_in_kb 64`) |
+
+Both spec-sheet figures the plan flagged as unverified hold: 40 CU exactly, and
+256 GB/s from `pp_dpm_mclk` topping out at 1000 MHz (LPDDR5X-8000 × 256 bit).
+So gfx1151 has **62.5% of R9700's CUs and 40.0% of its bandwidth** — the ratio
+the Phase 4 predictions are built on.
+
+**The 2 GiB VRAM carve-out is a red herring.** `rocm-smi --showmeminfo vram` and
+`mem_info_vram_total` both report 2 GiB, which looks alarming next to BASELINE's
+840 MB peak for the intersection stage alone. It is not the pool that gets used:
+
+| | bytes | |
+|---|---|---|
+| `mem_info_vram_total` | 2,147,483,648 | 2 GiB dedicated carve-out |
+| `mem_info_gtt_total` | 128,849,018,880 | 120 GiB unified, out of 123 GiB system |
+| `torch.cuda.get_device_properties().total_memory` | 128,849,018,880 | **120 GiB — torch reports GTT** |
+
+So there is no memory ceiling to work around and no BIOS UMA change to make. The
+tradeoff is that every allocation is LPDDR5X at 256 GB/s rather than a fast local
+carve-out, which is already what the bandwidth row says.
+
+**`multi_processor_count` reports 20, not 40.** HIP counts WGPs on RDNA, and RDNA
+pairs two CUs per WGP. 20 WGP = 40 CU, consistent with `rocminfo`. Anything sizing
+a grid off `multi_processor_count` gets half the number a CU count would suggest —
+on R9700 the same call returns 32 for its 64 CUs, so the 62.5% ratio is preserved
+and no kernel needs adjusting, but the absolute number is not a CU count.
+
+**`expandable_segments:True` is silently unavailable.** The image sets it as a
+Tier-1 anti-fragmentation knob, but torch on this platform answers
+`expandable_segments not supported on this platform` and ignores it. Harmless here
+for the same reason the memory ceiling is: 120 GiB against a workload that peaks
+under 1 GiB leaves no fragmentation pressure to manage.
 
 ## Cumulative training step, tile_size 8
 

@@ -109,6 +109,22 @@ if _HAS_TRITON:
         rule picks both observed optima -- SPLIT=1 at tile_size=8 (2 px/lane, 5.6 ms) and
         SPLIT=2 at tile_size=16 (4 px/lane, 6.9 ms).
 
+        On gfx1151 (RDNA 3.5) the *rule* survives but the *threshold* halves: the optimum
+        is 2 px/lane at both tile sizes, not "at most 4". Sweeping 640x480 / 20k Gaussians
+        with `--tune-report`, num_warps=1:
+
+            tile_size=8    SPLIT=1  ->  2 px/lane   1.043 ms   <- winner
+            tile_size=16   SPLIT=1  ->  8 px/lane   6.490 ms
+            tile_size=16   SPLIT=2  ->  4 px/lane   1.833 ms
+            tile_size=16   SPLIT=4  ->  2 px/lane   1.640 ms   <- winner
+
+        So RDNA 3.5 spills where RDNA 4 still fits, which is what a smaller per-SIMD VGPR
+        budget predicts, and the linear cost of re-walking the tile no longer outweighs it
+        at SPLIT=4. Concretely: `SPLIT = TILE*TILE / (64 * num_warps)` on this part against
+        `/(128 * num_warps)` on gfx1201. autotune finds this by itself -- the reason to
+        write it down is that carrying RDNA 4's threshold over as a hand-picked default
+        would cost 3.96x at tile_size=16, which is the whole spread of the sweep.
+
         num_warps moves px/lane too, but unlike SPLIT it puts the reduction across waves
         through LDS with barriers instead of keeping it in wave32 DPP. It never won at
         either tile size, and 4 was never competitive, so only 1 and 2 are kept.

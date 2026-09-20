@@ -26,7 +26,7 @@ papers in this series measure and is installed here as `fused_ssim_biauto`.
 
 Usage:
     GSPLAT_TILE_SIZE=8 python tests/train_realscene.py \
-        --data_dir .gsplat/examples/data/garden --result_dir results/realscene/garden
+        --data_dir data/360_v2/garden --result_dir results/realscene/garden
 
 Environment:
     GSPLAT_TILE_SIZE   required, forced on every rasterization() call, as in
@@ -46,15 +46,30 @@ import torch
 import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_EXAMPLES = os.path.join(os.path.dirname(_HERE), ".gsplat", "examples")
+
+# Two layouts, because this file is run from both. In the development tree gsplat is a
+# `.gsplat/` checkout beside `tests/`; in the gfx1151 container `tests/` is copied *into*
+# the gsplat checkout, so examples/ is the direct sibling. Probe for the dataset parser
+# itself rather than the directory, since only one of these has `datasets/colmap.py`.
+_EXAMPLES_CANDIDATES = (
+    os.path.join(os.path.dirname(_HERE), ".gsplat", "examples"),
+    os.path.join(os.path.dirname(_HERE), "examples"),
+)
+
+
+def _find_examples() -> str:
+    for cand in _EXAMPLES_CANDIDATES:
+        if os.path.isfile(os.path.join(cand, "datasets", "colmap.py")):
+            return cand
+    sys.exit("no gsplat examples (datasets/colmap.py) at any of:\n  "
+             + "\n  ".join(_EXAMPLES_CANDIDATES))
 
 
 def _install_examples_path() -> None:
     """Put gsplat's examples dir on sys.path for its dataset parser and utils."""
-    if not os.path.isdir(_EXAMPLES):
-        sys.exit(f"no gsplat examples at {_EXAMPLES}")
-    if _EXAMPLES not in sys.path:
-        sys.path.insert(0, _EXAMPLES)
+    examples = _find_examples()
+    if examples not in sys.path:
+        sys.path.insert(0, examples)
 
 
 def _force_tile_size() -> int:
